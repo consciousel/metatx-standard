@@ -1,26 +1,29 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import './App.css';
 import { ethers } from 'ethers';
-import contract from './contracts/GaslessNFT.json';
+// import contract from './contracts/GaslessNFT.json';
 import Button from "@material-ui/core/Button";
 import {
   NotificationContainer,
   NotificationManager
 } from "react-notifications";
 import "react-notifications/lib/notifications.css";
-import Web3 from "web3";
-import { Biconomy } from "@biconomy/mexa";
+import { Biconomy, getNonce } from "@biconomy/mexa";
 import {toBuffer} from "ethereumjs-util";
 
-
-const { config } = require("./config")
+var utils = require('lazy-cache')(require);
+var Web3 = require('web3');
+let abi = require('ethereumjs-abi');
+const { config } = require("./config");
 const contractAddress = config.contract.address;
-const abi = contract.abi;
-const biconomy = new Biconomy()
-let sigUtil = require('eth-sig-util');
-let web3, walletWeb3
-let chainId = 80001
-let apiKey = config.apiKey
+const contractAbi = config.contract.abi;
+const pubAddress = process.env.PUBLIC_KEY;
+let util = require('eth-sig-util');
+let web3, walletWeb3, nftCount, executeMetaTransactionData, myContract;
+const tokenCounter = {};
+let chainId = 80001;
+let apiKey = config.apiKey.biconomy;
+let contract;
 
 function App() {
   const [currentAccount, setCurrentAccount] = useState(null);
@@ -28,13 +31,9 @@ function App() {
   const [loadingMessage, setLoadingMessage] = React.useState(" Loading Application ...");
   const [metaTxEnabled, setMetaTxEnabled] = useState(true);
   const [transactionHash, setTransactionHash] = useState("");
+  const [counter, setCounter] = useState("");
   const { ethereum } = window;
-
-  let options = {
-          apiKey: apiKey,
-          debug: true
-        };
-
+ 
   useEffect(() => {
     async function init() {
       if (
@@ -44,34 +43,42 @@ function App() {
         // Ethereum User detected. You can proceed with the provider.
         const provider = window["ethereum"];
         await provider.enable();
-        let ethersProvider = new ethers.providers.Web3Provider(provider);
+        let mumbaiProvider = new Web3.providers.HttpProvider("https://polygon-mumbai.infura.io/v3/ee0a76ad6de8448f933dad70e2d4ad54")
         setLoadingMessage("Initializing Biconomy ...");
-        
-        const biconomy = new Biconomy(ethersProvider, options);
+        const biconomy = new Biconomy(mumbaiProvider, { apiKey: apiKey, debug: true });
 
         // This web3 instance will be used to read normally and write contract via meta transactions.
         const web3 = new Web3(biconomy);
 
+        const nftCount = await getNFTCount();
+        setCounter(nftCount);
+
         // This web3 instance will be used to get user signature from connected wallet
         walletWeb3 = new Web3(window.ethereum);
+        console.log(walletWeb3)
 
         biconomy.onEvent(biconomy.READY, () => {
+          console.log(loadingMessage)
           // Initialise Dapp here
-          const signer = provider.getSigner();
-          const nftContract = new ethers.Contract(contractAddress, abi, signer);
+          contract = new web3.eth.Contract(
+            contractAbi,
+            contractAddress
+          );
           setCurrentAccount(provider.currentAccount);
-          getMintCount();
+          getNFTCount();
+          getNonce();
           provider.on("accountsChanged", function (accounts){
-            setCurrentAccount(accounts[0]);
+            setCurrentAccount(accounts[0]);           
           });
         }) .onEvent(biconomy.ERROR, (error, message) => {
           // Handle error while Initializing mexa 
+          console.log("Error Initializing Mexa")
         });
       } else {
         showErrorMessage("Metamask not installed")
-      }
+      };
     }
-    init(options);
+    init();
   },[]);
 
   const handleSubmit = (e) => {
@@ -80,8 +87,108 @@ function App() {
       showSuccessMessage("URI link available, ready to mint.");
       console.log(newTokenURI);
     } else {
-        showErrorMessage("Please insert URI link!")
+      showErrorMessage("Please insert URI link!")
     }
+  };
+
+  const onSubmitWithPrivateKey = async () => {
+    if (newTokenURI != "" && contract) {
+        setTransactionHash("");
+        if (metaTxEnabled) {
+            console.log("Sending meta transaction");
+
+            // NOTE: prepend 0x in private key to be used with web3.js
+            let privateKey = "11d093f72a5d5e55e48732a02e16250921013f150fed6c1180d065e1224fab5f";
+            let userAddress = "0xca880b5262FE5b95902841a44e6caBC3243Ae67b";
+            let nonce = await getNonce();
+            let functionSignature = contract.methods.mint(newTokenURI).encodeABI();
+            let messageToSign = constructMetaTransactionMessage(nonce, chainId, functionSignature, contractAddress);
+            
+            let {signature} = walletWeb3.eth.accounts.sign("0x" + messageToSign.toString("hex"), privateKey);
+            console.log(signature)
+            let { r, s, v } = getSignatureParameters(signature);
+            let executeMetaTransactionData = contract.methods.executeMetaTransaction(userAddress, functionSignature, r, s, v).encodeABI();
+            let txParams = {
+              "from": userAddress,
+              "to": contractAddress,
+              "value": "0x0",
+              "gas": "100000",
+              "data": executeMetaTransactionData
+            };
+            const signedTx = await web3.eth.accounts.signTransaction(txParams, `0x${privateKey}`);
+            let receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction, (error, txHash) => {
+              if (error) {
+                return console.error(error);
+              }
+              console.log("Transaction hash is ", txHash);
+              showInfoMessage(`Transaction sent to blockchain with hash ${txHash}`);
+            });
+            setTransactionHash(receipt.transactionHash);
+            showSuccessMessage("Transaction confirmed");
+            nftCount = await getNFTCount();
+            showInfoMessage(`You have successfully minted NFT number ${nftCount}`)
+        } else {
+            console.log("Sending normal transaction");
+            contract.methods
+              .mint(newTokenURI)
+              .send({ from: currentAccount })
+              .on("transactionHash", function (hash) {
+                showInfoMessage(`Transaction sent to blockchain with hash ${hash}`);
+              })
+              .once("confirmation", function (confirmationNumber, receipt) {
+                setTransactionHash(receipt.transactionHash);
+                showSuccessMessage("Transaction confirmed");
+                getNFTCount();
+                showInfoMessage(`You have successfully minted NFT number ${counter}`)
+              });
+        }
+    } else {
+        showErrorMessage("Please insert the uri link for your nft media data.");
+    }
+  }
+
+  // Get count of minted NFTs from network
+  const getNFTCount = async() => {
+    if (
+          typeof window.ethereum !== "undefined" && 
+          window.ethereum.isMetaMask
+        ) {
+      console.log("Wallet exists! Getting minted NFT count!")
+    }
+    try {
+      const provider = new Web3.providers.HttpProvider("https://polygon-mumbai.infura.io/v3/ee0a76ad6de8448f933dad70e2d4ad54")
+      walletWeb3 = new Web3(provider);
+      const contract = new walletWeb3.eth.Contract( contractAbi, contractAddress,{
+        from: currentAccount
+      })
+      const nftCount = await contract.methods.tokenCounter().call();
+      setCounter(nftCount);
+
+      return nftCount     
+    } catch (err) {
+      console.log(err)
+    };
+  };
+
+  const getNonce = async() => {
+    if (
+          typeof window.ethereum !== "undefined" && 
+          window.ethereum.isMetaMask
+        ) {
+      console.log("Wallet exists! Getting latest nonce!")
+    }
+    try {
+      const provider = new Web3.providers.HttpProvider("https://polygon-mumbai.infura.io/v3/ee0a76ad6de8448f933dad70e2d4ad54")
+      walletWeb3 = new Web3(provider);
+      const users = await ethereum.request({ method: 'eth_accounts' });
+      const user = users[0];;
+      const nonce = await walletWeb3.eth.getTransactionCount(user , 'latest'); //get latest nonce
+      console.log(nonce)
+
+      return nonce     
+    } catch (err) {
+      console.log(err)
+    };
   };
 
   const checkWalletIsConnected = useCallback(async () => {
@@ -122,8 +229,8 @@ function App() {
 
   const constructMetaTransactionMessage = (nonce, chainId, functionSignature, contractAddress) => {
     return abi.soliditySHA3(
-        ["uint256","address","uint256","bytes"],
-        [nonce, contractAddress, chainId, toBuffer(functionSignature)]
+      ["uint256","address","uint256","bytes"],
+      [nonce, contractAddress, chainId, toBuffer(functionSignature)]
     );
   }
 
@@ -131,13 +238,11 @@ function App() {
     console.log(newTokenURI);
     if (newTokenURI !== "" && contract) {
       try {
-
         if (ethereum) {
           if(metaTxEnabled){
-            console.log("Sending meta transaction...");
-
+            console.log("Sending meta transaction...");                  
             let userAddress = currentAccount
-            let nonce = await contract.methods.getNonce(userAddress).call();
+            let nonce = await getNonce(); //get latest nonce;
             let functionSignature = contract.methods.mint(newTokenURI).encodeABI();
             let messageToSign = constructMetaTransactionMessage(nonce, chainId, functionSignature, contractAddress)
 
@@ -147,16 +252,15 @@ function App() {
             userAddress
             );
 
-            // Using walletWeb3 here, as it is connected tto the wallet where user account is present.
+            // Using walletWeb3 here, as it is connected to the wallet where user account is present.
             let { r, s, v } = getSignatureParameters(signature);
             sendSignedTransaction(userAddress, functionSignature, r, s, v);
-
           } else {
             console.log("Sending normal transaction...");
 
             const provider = new ethers.providers.Web3Provider(ethereum);
-            const signer = provider.getSigner();
-            const nftContract = new ethers.Contract(contractAddress, abi, signer);
+            const signer = ethers.provider.getSigner();
+            const nftContract = new ethers.Contract(contractAddress, contractAbi, signer);
 
             console.log("Initialize payment");
             let nftTxn = await nftContract.mint(newTokenURI);
@@ -271,9 +375,14 @@ function App() {
             <h1>Ready to mint NFT with URI: {newTokenURI}</h1>
           </div>
           <div>
-            <button variant="contained" color="primary" onClick={mintNftHandler}>
+            <button variant="contained" color="primary" onClick={mintNftHandler} style={{ marginLeft: "10px" }}>
               Mint NFT
             </button>
+              <div>
+                <Button variant="contained" color="primary" onClick={onSubmitWithPrivateKey} style={{ marginLeft: "10px" }}>
+                  Mint NFT (using private key)
+                </Button>
+              </div>
           </div>
         </div>
         </>
@@ -296,7 +405,7 @@ function App() {
       <section className="main">
         <div className="header-container">
           <p className="header">🍃 <strong>Mint any NFT with media URI</strong> 🍃</p>
-          <p className="sub-text">Upload your files to Arweave or any other web3 file storage system, type in the URI link to your media metadata below and mint your NFT.</p>
+          <p className="sub-text">Upload your files to IPFS, Arweave or any other web3 file storage system, type in the URI link to your media metadata below and mint your NFT.</p>
           {currentAccount ? `Connected with wallet ${currentAccount}` : `Please connect your wallet below to proceed`}
         </div>
       </section>
